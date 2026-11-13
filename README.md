@@ -19,8 +19,10 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ./build/ppl_tests
 ./build/ppl_bench
-./build/ppl_run --frames 3000 --csv results/baseline_run1.csv
-python3 scripts/plot_latency.py results/baseline_run1.csv
+for i in 1 2 3 4 5; do
+  ./build/ppl_run --frames 3000 --csv results/baseline_run$i.csv
+  python3 scripts/plot_latency.py results/baseline_run$i.csv
+done
 ```
 
 ## Pipeline (Step 1)
@@ -31,39 +33,50 @@ A simulated camera produces 1280×720 RGB frames at a fixed 30 FPS (33.3 ms budg
 2. **Inference:** a fixed 4096 → 256 matrix-vector multiply standing in for a neural network (compute-bound)
 3. **Tracking:** counts scores above a threshold
 
-All buffers are allocated once at startup, so the timed loop never allocates. Latency is measured end to end, from capture to tracker output, with `std::chrono::steady_clock`. The first 100 frames are discarded as warm-up.
+All buffers are allocated once at startup, so the timed loop never allocates (checked by a unit test). Latency is measured end to end, from capture to tracker output, with `std::chrono::steady_clock`. The first 100 frames of each run are discarded as warm-up. Percentiles use the nearest-rank method.
 
 ## Results
 
 ### Step 1: single-threaded baseline (tag `v0.1-baseline`)
 
-3,000 frames at 30 FPS, 1 run so far.
+5 runs × 3,000 frames at 30 FPS. Each value is the **median across the 5 runs**.
 
 | Stage | p50 (ms) | p99 (ms) | p99.9 (ms) | max (ms) | mean (ms) |
 |---|---|---|---|---|---|
-| **Total (end to end)** | **12.637** | **21.142** | **25.610** | **25.928** | **12.847** |
-| Preprocess | 5.953 | 11.525 | 15.800 | 17.708 | 6.179 |
-| Inference | 2.610 | 5.488 | 8.444 | 12.688 | 2.696 |
-| Tracking | 0.001 | 0.002 | 0.057 | 0.165 | 0.001 |
+| **Total (end to end)** | **14.482** | **21.216** | **24.359** | **25.700** | **14.226** |
+| Preprocess | 6.925 | 11.278 | 14.153 | 16.284 | 6.785 |
+| Inference | 2.968 | 5.439 | 7.796 | 10.817 | 2.965 |
+| Tracking | 0.001 | 0.002 | 0.025 | 0.244 | 0.001 |
 
-Deadline misses: **0 of 3,000** (worst frame 25.9 ms against a 33.3 ms budget).
+Deadline misses: **0 of 15,000 frames** across all runs. The worst single frame (27.2 ms) still left 6.2 ms of the 33.3 ms budget.
 
-![Step 1 baseline latency](results/baseline_run1.png)
+Run-to-run spread of end-to-end latency:
 
-Microbenchmarks (Google Benchmark, each stage in isolation, hot loop):
+| Run | p50 (ms) | p99 (ms) | p99.9 (ms) | max (ms) |
+|---|---|---|---|---|
+| 1 | 14.482 | 21.216 | 24.497 | 25.700 |
+| 2 | 11.912 | 21.158 | 23.928 | 25.176 |
+| 3 | 15.265 | 21.831 | 24.359 | 27.000 |
+| 4 | 14.871 | 22.110 | 25.259 | 27.168 |
+| 5 | 10.753 | 18.863 | 22.346 | 24.800 |
+
+![Step 1 baseline latency, run 1](results/baseline_run1.png)
+
+Microbenchmarks (Google Benchmark, each stage in isolation in a hot loop, single run):
 
 | Benchmark | Time |
 |---|---|
-| Capture | 1.34 ms |
-| Preprocess | 2.00 ms |
-| Inference | 0.786 ms |
-| Tracking | 0.204 µs |
+| Capture | 0.889 ms |
+| Preprocess | 1.96 ms |
+| Inference | 0.901 ms |
+| Tracking | 0.210 µs |
 
 ### Observations
 
-- **The tail is long relative to the median.** End-to-end p99 is 1.7× the p50, and the slowest frame is 2.1× the p50, on a single-threaded loop doing identical work every frame. That spread comes from the environment, not the code: scheduling, cache state and the hypervisor. It's the baseline every later design has to beat.
-- **Every stage runs about 3× slower in the pipeline than in its microbenchmark.** Preprocess has a median of 5.95 ms in the pipeline against 2.00 ms isolated; inference 2.61 ms against 0.79 ms; capture about 4.0 ms (by mean subtraction) against 1.34 ms. Because the ratio is the same across a memory-bound and a compute-bound stage, it points to something systematic rather than to either stage's code. The leading hypothesis: the pipeline sleeps about 20 ms between frames, so each frame starts with a lowered CPU clock and caches that other work has partly evicted, while the microbenchmark runs back-to-back with a hot cache at full clock. **Planned test:** rerun with `--fps 1000` (no sleeping). If the per-stage times converge on the microbenchmarks, the cause is idle-state recovery, which matters for any real-time loop that sleeps between frames.
-- **The 30 FPS budget has headroom:** the worst frame left 7.4 ms of slack.
+- **The tail is long relative to the median.** End-to-end p99 is 1.5× the p50, and the slowest frame is 1.8× the p50, on a single-threaded loop doing identical work every frame (the checksum is identical in all runs). That spread comes from the environment, not the code: scheduling, cache state and the hypervisor. It's the baseline every later design has to beat.
+- **The median moves more between runs than the tail does.** p50 ranged from 10.8 to 15.3 ms across runs (a 42% spread), while p99 ranged from 18.9 to 22.1 ms (17%). A single run would have been misleading, which is why every result here is a median of 5.
+- **Every stage runs 3–5× slower in the pipeline than in its microbenchmark.** Preprocess has a median of 6.93 ms in the pipeline against 1.96 ms isolated (3.5×); inference 2.97 ms against 0.90 ms (3.3×); capture about 4.5 ms (total minus stages) against 0.89 ms. The slowdown hits a memory-bound and a compute-bound stage alike, which points to something systematic rather than to either stage's code. The leading hypothesis: the pipeline sleeps about 20 ms between frames, so each frame starts with a lowered CPU clock and caches that other work has partly evicted, while the microbenchmark runs back-to-back with a hot cache at full clock. **Planned test:** rerun with `--fps 1000` (no sleeping). If the per-stage times converge on the microbenchmarks, the cause is idle-state recovery, which matters for any real-time loop that sleeps between frames.
+- **Microbenchmarks are noisy too.** Between two `ppl_bench` runs, capture changed by 34% and inference by 15%. Any automated regression gate (Step 9) will need repeated measurements and a threshold above this noise.
 
 ## Roadmap
 
